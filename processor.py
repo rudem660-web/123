@@ -36,8 +36,228 @@ class VideoInfo:
 
 
 class VideoProcessor:
-    ...
-    # ВСТАВЬТЕ НИЖЕ, НО ВНУТРИ КЛАССА (4 пробела слева)
+    """
+    Main video processing pipeline.
+    Coordinates all transformation modules to generate unique video variants.
+    """
+
+    def __init__(self, app_settings: AppSettings = None):
+        self.settings = app_settings or settings
+        self.progress_callback: Optional[Callable[[float, str], None]] = None
+
+        # Lazy-loaded transformation modules
+        self._visual = None
+        self._audio = None
+        self._metadata = None
+        self._vfx = None
+        self._subliminal = None
+        self._watermark = None
+        self._neural = None
+        self._encoder = None
+
+        # Initialize LUT pool
+        from config import LUTS_DIR
+        self.lut_pool = list(LUTS_DIR.glob("*.cube")) if LUTS_DIR.exists() else []
+
+        # Initialize Neural Stylizer
+        from neural.style_transfer import StyleTransfer
+        self._style_transfer = StyleTransfer()
+
+    # ... analyze_video, process и др. уже есть выше ...
+
+    def _process_single(
+        self,
+        video_info: VideoInfo,
+        preset,
+        output_dir: str,
+        base_progress: float,
+        progress_range: float
+    ) -> str:
+        """Process a single variant for one platform"""
+        # Generate random parameters
+        params = self._generate_random_params(preset, video_info)
+
+        # Generate output filename
+        output_filename = self._generate_filename(preset.name)
+        output_path = os.path.join(output_dir, output_filename)
+
+        # Build FFmpeg filter chain
+        filters = self._build_filter_chain(video_info, params)
+
+        # Build FFmpeg command
+        cmd = self._build_ffmpeg_command(
+            video_info.path,
+            output_path,
+            params,
+            filters
+        )
+
+        self._update_progress(
+            base_progress + progress_range * 0.3,
+            f"Encoding {preset.name}..."
+        )
+
+        # Add watermark input if needed
+        if 'watermark_path' in params and params['watermark_path']:
+            cmd.insert(4, '-i')
+            cmd.insert(5, params['watermark_path'])
+
+        # Execute FFmpeg
+        try:
+            extra_args = []
+
+            if self.settings.enable_junk_data:
+                import string
+                import uuid
+                junk_msg = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
+                u_id = uuid.uuid4().hex
+                extra_args.extend(['-bsf:v', f"h264_metadata=sei_user_data='{u_id}+{junk_msg}'"])
+                extra_args.extend(['-metadata', f'junk_hash={junk_msg}'])
+
+            if getattr(self.settings, 'enable_atomic_reorder', False):
+                extra_args.extend(['-movflags', '+faststart+frag_keyframe+empty_moov'])
+
+            if not self.settings.enable_neural:
+                # Standard (fast) path
+                final_cmd = cmd[:-1] + extra_args + [cmd[-1]]
+                subprocess.run(final_cmd, check=True, capture_output=True)
+            else:
+                # Neural path
+                self._process_neural_wrapper(
+                    cmd, output_path, video_info, params,
+                    base_progress, progress_range, extra_args
+                )
+
+        except subprocess.CalledProcessError as e:
+            stderr_text = e.stderr.decode(errors='replace') if e.stderr else "No stderr output"
+            raise RuntimeError(f"FFmpeg encoding failed: {stderr_text}")
+        except Exception as e:
+            raise RuntimeError(f"Processing error: {str(e)}")
+
+        # Apply metadata
+        if self.settings.enable_random_metadata:
+            self._update_progress(
+                base_progress + progress_range * 0.9,
+                "Applying metadata..."
+            )
+            self._apply_metadata(output_path, params)
+
+        # Save processing report
+        self._save_report(output_path, params)
+        return output_path
+
+    def _process_neural_wrapper(
+        self,
+        cmd: list[str],
+        output_path: str,
+        video_info: VideoInfo,
+        params: dict,
+        base_progress: float,
+        progress_range: float,
+        extra_args: List[str] = None
+    ):
+        """Piped processing with frame-by-frame neural stylization"""
+        import numpy as np
+        import cv2
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            temp_base = os.path.join(tmp_dir, "base_variant.mp4")
+            extra_args = extra_args or []
+
+            # 1. Create base variant without neural processing
+            cmd_base = cmd[:-1] + extra_args + [temp_base]
+            subprocess.run(cmd_base, check=True, capture_output=True)
+
+            # 2. Get ACTUAL dimensions of processed video
+            analyze_cmd = [
+                'ffprobe', '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height',
+                '-of', 'csv=s=x:p=0',
+                temp_base
+            ]
+            result = subprocess.run(analyze_cmd, capture_output=True, text=True)
+            w, h = map(int, result.stdout.strip().split('x'))
+
+            self._update_progress(
+                base_progress + progress_range * 0.4,
+                "Applying Neural Styling..."
+            )
+
+            # 3. Get FPS from params
+            fps = params['fps']
+            frame_size = w * h * 3
+            total_frames = int(video_info.duration * fps)
+
+            # 4. Start neural processing pipeline
+            proc_in = subprocess.Popen(
+                ['ffmpeg', '-i', temp_base, '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-'],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+
+            codec_name, _ = params['codec']
+            proc_out = subprocess.Popen(
+                [
+                    'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+                    '-s', f'{w}x{h}', '-pix_fmt', 'bgr24', '-r', str(fps),
+                    '-i', '-', '-i', temp_base,
+                    '-map', '0:v', '-map', '1:a',
+                    '-c:v', codec_name, '-c:a', 'copy',
+                    '-pix_fmt', 'yuv420p',
+                    '-crf', str(params['crf']), '-preset', 'medium',
+                    *extra_args,
+                    output_path
+                ],
+                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+
+            try:
+                frame_idx = 0
+                batch_frames = []
+                batch_size = 8
+
+                while True:
+                    raw_frame = proc_in.stdout.read(frame_size)
+                    if not raw_frame or len(raw_frame) < frame_size:
+                        if batch_frames:
+                            styled_batch = self._style_transfer.apply_random_style(
+                                np.array(batch_frames)
+                            )
+                            for frame in styled_batch:
+                                proc_out.stdin.write(frame.tobytes())
+                        break
+
+                    frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((h, w, 3))
+                    batch_frames.append(frame)
+
+                    if len(batch_frames) >= batch_size:
+                        styled_batch = self._style_transfer.apply_random_style(
+                            np.array(batch_frames)
+                        )
+                        for f in styled_batch:
+                            proc_out.stdin.write(f.tobytes())
+                        batch_frames = []
+
+                    frame_idx += 1
+                    if frame_idx % 30 == 0:
+                        prog = (frame_idx / total_frames) * 0.5
+                        self._update_progress(
+                            base_progress + progress_range * (0.4 + prog),
+                            f"Neural Processing: {frame_idx}/{total_frames} frames"
+                        )
+
+            finally:
+                try:
+                    proc_in.stdout.close()
+                    proc_out.stdin.close()
+                    proc_in.wait(timeout=10)
+                    proc_out.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    proc_in.terminate()
+                    proc_out.terminate()
+                    proc_in.wait()
+                    proc_out.wait()
 
     def _generate_random_params(self, preset, video_info: VideoInfo) -> dict:
         """Generate randomized transformation parameters"""
@@ -60,7 +280,7 @@ class VideoProcessor:
             'fps': preset.get_random_fps(),
             'bitrate': preset.get_random_bitrate(),
 
-            # Base speed from range (Updated to 0.85-1.20)
+            # Base speed
             'speed': random.uniform(*scale_range(v.speed)),
             'crop_percent': random.uniform(*scale_range(v.crop_percent)),
             'mirror': random.random() < v.mirror_chance,
@@ -74,18 +294,15 @@ class VideoProcessor:
             'vignette': random.uniform(*scale_range(v.vignette_percent)),
             'grid_opacity': random.uniform(*scale_range(v.grid_opacity)) if random.random() < 0.2 else 0.0,
 
-            # SmartFit 59s flag
+            # SmartFit flag
             'smart_fit_active': False,
 
-            # Color Balance (RGB Shadows)
+            # Color balance
             'cb_rs': random.uniform(*scale_range(v.color_balance_rs)),
             'cb_gs': random.uniform(*scale_range(v.color_balance_gs)),
             'cb_bs': random.uniform(*scale_range(v.color_balance_bs)),
 
-            # Ultra Green Neutralizer
             'neutralizer': -0.06 if random.random() < 0.8 else -0.03,
-
-            # Aesthetic bias
             'aesthetic_bias': random.choice(['cold', 'warm', 'neutral', 'cinematic', 'neutral', 'neutral']),
 
             # Trimming
@@ -95,7 +312,6 @@ class VideoProcessor:
             'lut_path': str(random.choice(self.lut_pool)) if self.lut_pool and random.random() < 0.6 else None,
             'lut_strength': random.uniform(0.2, 0.4),
 
-            # Variable speed ramping
             'speed_ramp_active': random.random() < 0.4,
             'speed_ramp_points': [],
 
@@ -116,7 +332,7 @@ class VideoProcessor:
             'software': random.choice(SOFTWARE_POOL),
         }
 
-        # SmartFit 59s логика (как в вашей версии)
+        # SmartFit 59s
         short_form_platforms = ['TikTok', 'YouTube Shorts', 'Instagram Reels']
         if preset.name in short_form_platforms and video_info.duration > 59.0:
             params['smart_fit_active'] = True
@@ -132,7 +348,7 @@ class VideoProcessor:
                 params['trim_start'] += excess * 0.5
                 params['trim_end'] += excess * 0.5
 
-        # Speed ramp точки
+        # Speed ramp points
         if params['speed_ramp_active']:
             duration = video_info.duration
             num_points = random.randint(2, 3)
@@ -143,7 +359,7 @@ class VideoProcessor:
                     'duration': random.uniform(0.5, 1.5),
                 })
 
-        # VFX + Audio filters и final_duration (как в оригинале)
+        # VFX & audio filters
         audio_sync = None
         vfx_filters_str = None
         vfx_params = None
@@ -155,7 +371,9 @@ class VideoProcessor:
             vfx_filters_str, vfx_params = generate_vfx_filters(level=level)
             from transformations.vfx import VFXProcessor
             vfx_proc = VFXProcessor()
-            audio_sync = vfx_proc.build_audio_sync_filters(vfx_params, video_fps=video_info.fps)
+            audio_sync = vfx_proc.build_audio_sync_filters(
+                vfx_params, video_fps=video_info.fps
+            )
 
         from transformations.audio import generate_audio_filters
         v_speed = params.get('speed', 1.0)
@@ -181,273 +399,13 @@ class VideoProcessor:
 
         return params
 
-
-def _process_neural_wrapper(
-    self,
-    cmd: list[str],
-    output_path: str,
-    video_info: VideoInfo,
-    params: dict,
-    base_progress: float,
-    progress_range: float,
-    extra_args: List[str] = None
-):
-    """Piped processing with frame-by-frame neural stylization"""
-    import numpy as np
-    import cv2
-    import tempfile
-    
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        temp_base = os.path.join(tmp_dir, "base_variant.mp4")
-        extra_args = extra_args or []
-        
-        # 1. Create base variant without neural processing
-        cmd_base = cmd[:-1] + extra_args + [temp_base]
-        subprocess.run(cmd_base, check=True, capture_output=True)
-        
-        # 2. Get ACTUAL dimensions of processed video
-        analyze_cmd = [
-            'ffprobe', '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height',
-            '-of', 'csv=s=x:p=0',
-            temp_base
-        ]
-        result = subprocess.run(analyze_cmd, capture_output=True, text=True)
-        w, h = map(int, result.stdout.strip().split('x'))
-        
-        self._update_progress(base_progress + progress_range * 0.4, "Applying Neural Styling...")
-        
-        # 3. Get FPS from params
-        fps = params['fps']
-        frame_size = w * h * 3
-        total_frames = int(video_info.duration * fps)
-        
-        # 4. Start neural processing pipeline
-        proc_in = subprocess.Popen(
-            ['ffmpeg', '-i', temp_base, '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-'],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-        
-        codec_name, _ = params['codec']
-        proc_out = subprocess.Popen([
-            'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
-            '-s', f'{w}x{h}', '-pix_fmt', 'bgr24', '-r', str(fps),
-            '-i', '-', '-i', temp_base,
-            '-map', '0:v', '-map', '1:a',
-            '-c:v', codec_name, '-c:a', 'copy',
-            '-pix_fmt', 'yuv420p',
-            '-crf', str(params['crf']), '-preset', 'medium',
-            *extra_args,
-            output_path
-        ],
-            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-        
-        try:
-            frame_idx = 0
-            batch_frames = []
-            batch_size = 8
-            
-            while True:
-                raw_frame = proc_in.stdout.read(frame_size)
-                if not raw_frame or len(raw_frame) < frame_size:
-                    # Flush remaining frames
-                    if batch_frames:
-                        styled_batch = self._style_transfer.apply_random_style(np.array(batch_frames))
-                        for frame in styled_batch:
-                            proc_out.stdin.write(frame.tobytes())
-                    break
-                
-                # Reshape with ACTUAL dimensions
-                frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((h, w, 3))
-                batch_frames.append(frame)
-                
-                if len(batch_frames) >= batch_size:
-                    styled_batch = self._style_transfer.apply_random_style(np.array(batch_frames))
-                    for f in styled_batch:
-                        proc_out.stdin.write(f.tobytes())
-                    batch_frames = []
-                
-                frame_idx += 1
-                if frame_idx % 30 == 0:
-                    prog = (frame_idx / total_frames) * 0.5
-                    self._update_progress(
-                        base_progress + progress_range * (0.4 + prog),
-                        f"Neural Processing: {frame_idx}/{total_frames} frames"
-                    )
-        
-        finally:
-            try:
-                proc_in.stdout.close()
-                proc_out.stdin.close()
-                proc_in.wait(timeout=10)
-                proc_out.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                proc_in.terminate()
-                proc_out.terminate()
-                proc_in.wait()
-                proc_out.wait()
-    def _generate_random_params(self, preset, video_info: VideoInfo) -> dict:
-        """Generate randomized transformation parameters"""
-        level = self.settings.uniqueization_level
-        
-        def scale_range(range_tuple):
-            """Scale a range based on uniqueization level"""
-            min_val, max_val = range_tuple
-            mid = (min_val + max_val) / 2
-            half_range = (max_val - min_val) / 2 * level
-            return (mid - half_range, mid + half_range)
-        
-        v = self.settings.visual
-        a = self.settings.audio
-        e = self.settings.encoding
-        
-        params = {
-            # Resolution and format
-            'resolution': preset.get_random_resolution(),
-            'fps': preset.get_random_fps(),
-            'bitrate': preset.get_random_bitrate(),
-            
-            # Base speed from range (Updated to 0.85-1.20)
-            'speed': random.uniform(*scale_range(v.speed)),
-            'crop_percent': random.uniform(*scale_range(v.crop_percent)),
-            'mirror': random.random() < v.mirror_chance,
-            'rotation': random.uniform(*scale_range(v.rotation_degrees)),
-            'hue_shift': random.uniform(*scale_range(v.hue_shift)),
-            'saturation': random.uniform(*scale_range(v.saturation_shift)),
-            'brightness': random.uniform(*scale_range(v.brightness)),
-            'contrast': random.uniform(*scale_range(v.contrast)),
-            'gamma': random.uniform(*scale_range(v.gamma)),
-            'noise': random.uniform(*scale_range(v.noise_percent)),
-            'vignette': random.uniform(*scale_range(v.vignette_percent)),
-            'grid_opacity': random.uniform(*scale_range(v.grid_opacity)) if random.random() < 0.2 else 0.0,
-            
-            # SmartFit 59s Duration Policy (User requested)
-            'smart_fit_active': False,
-            
-            # Color Balance (RGB Shadows)
-            'cb_rs': random.uniform(*scale_range(v.color_balance_rs)),
-            'cb_gs': random.uniform(*scale_range(v.color_balance_gs)),
-            'cb_bs': random.uniform(*scale_range(v.color_balance_bs)),
-            
-            # Ultra Green Neutralizer (Aggressive)
-            # We enforce a strong negative drift for green shadows to avoid 'chemical' look
-            'neutralizer': -0.06 if random.random() < 0.8 else -0.03,
-            
-            # Global Aesthetic Bias (Now with 'Neutral' weight)
-            'aesthetic_bias': random.choice(['cold', 'warm', 'neutral', 'cinematic', 'neutral', 'neutral']),
-            
-            # Trimming
-            'trim_start': random.uniform(*scale_range(v.trim_start_range)),
-            'trim_end': random.uniform(*scale_range(v.trim_end_range)),
-            
-            'lut_path': str(random.choice(self.lut_pool)) if self.lut_pool and random.random() < 0.6 else None,
-            'lut_strength': random.uniform(0.2, 0.4), # Professional transparent depth
-            
-            # Variable Speed Ramping (Dynamic tempo)
-            'speed_ramp_active': random.random() < 0.4, # 40% chance
-            'speed_ramp_points': [], # Will be populated if active
-            
-            # Audio
-            'pitch_shift': random.uniform(*scale_range(a.pitch_semitones)),
-            'audio_speed': random.uniform(*scale_range(a.speed)),
-            'reverb': random.uniform(*scale_range(a.reverb_percent)),
-            'bass_boost': random.uniform(*scale_range(a.bass_boost_db)),
-            
-            # Encoding
-            'codec': random.choice(CODEC_POOL),
-            'gop_size': random.randint(*e.gop_size),
-            'b_frames': random.randint(*e.b_frames),
-            'crf': random.randint(*e.crf),
-            
-        # Metadata
-            'device': random.choice(DEVICE_POOL),
-            'software': random.choice(SOFTWARE_POOL),
-        }
-        
-        # APPLY SMART FIT 59S LOGIC
-        short_form_platforms = ['TikTok', 'YouTube Shorts', 'Instagram Reels']
-        if preset.name in short_form_platforms and video_info.duration > 59.0:
-             params['smart_fit_active'] = True
-             # 1. Calc absolute minimum duration we can reach with max speed (1.20)
-             # duration_after_speed = duration / 1.20
-             # We want duration_after_speed <= 59.0
-             target_duration = 59.0
-             current_duration = video_info.duration
-             
-             # Optimal speed factor to hit 59s
-             required_speed = current_duration / target_duration
-             if required_speed <= 1.20:
-                  # Use exactly the speed needed to reach 59s
-                  params['speed'] = required_speed
-                  # Standard trimming applies (0.1 - 0.5s total)
-             else:
-                  # Hard cap speed at 1.20
-                  params['speed'] = 1.20
-                  # The rest must be trimmed
-                  excess = current_duration - (target_duration * 1.20)
-                  # Add excess to trimming
-                  params['trim_start'] += excess * 0.5
-                  params['trim_end'] += excess * 0.5
-                  
-        # Generate Speed Ramp points if active
-        if params['speed_ramp_active']:
-             duration = video_info.duration
-             # Create 2-3 impact points for speed changes
-             num_points = random.randint(2, 3)
-             for _ in range(num_points):
-                  params['speed_ramp_points'].append({
-                       'time': random.uniform(0.2, 0.8) * duration,
-                       'factor': random.uniform(0.7, 1.3),
-                       'duration': random.uniform(0.5, 1.5)
-                  })
-
-        audio_sync = None
-        vfx_filters_str = None
-        vfx_params = None
-        
-        # Calculate new duration after trimming
-        new_duration = video_info.duration - params['trim_start'] - params['trim_end']
-        new_duration = max(0.5, new_duration) # Safety
-        
-        if self.settings.enable_vfx:
-            vfx_filters_str, vfx_params = generate_vfx_filters(level=level)
-            from transformations.vfx import VFXProcessor
-            vfx_proc = VFXProcessor()
-            audio_sync = vfx_proc.build_audio_sync_filters(vfx_params, video_fps=video_info.fps)
-        
-        from transformations.audio import generate_audio_filters
-        v_speed = params.get('speed', 1.0)
-        audio_filters_str, audio_params = generate_audio_filters(
-            level=self.settings.uniqueization_level,
-            video_speed=v_speed,
-            sync_filter=audio_sync,
-            trim_start=params['trim_start'],
-            trim_duration=new_duration
-        )
-        
-        params.update({
-            'audio_filters': audio_filters_str,
-            'audio_params': audio_params,
-            'vfx_filters': vfx_filters_str,
-            'vfx_params': vfx_params,
-            'final_duration': new_duration / params['speed']
-        })
-        
-        # Watermark params (if enabled)
-        if self.settings.enable_watermark and hasattr(self.settings, 'watermark_path'):
-             params['watermark_path'] = self.settings.watermark_path
-             params['watermark_pos'] = getattr(self.settings, 'watermark_pos', 'Bottom Right')
-        
-        return params
-    
     def _generate_filename(self, platform_name: str) -> str:
         """Generate random filename for output"""
         base = random.choice(FILENAME_POOL)
         suffix = random.randint(1, 999)
         platform_short = platform_name.lower().replace(' ', '_')[:3]
         return f"{base}{suffix}_{platform_short}.mp4"
+
     
     # ========================================================================
     # FFMPEG BUILDING
