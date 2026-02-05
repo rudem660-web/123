@@ -64,6 +64,131 @@ class VideoProcessor:
         self._style_transfer = StyleTransfer()
 
     # ... analyze_video, process и др. уже есть выше ...
+    def set_progress_callback(self, callback: Callable[[float, str], None]):
+        """Set callback for progress updates: callback(progress: 0.0-1.0, status: str)"""
+        self.progress_callback = callback
+
+    def _update_progress(self, progress: float, status: str):
+        """Update progress if callback is set"""
+        if self.progress_callback:
+            self.progress_callback(progress, status)
+    def analyze_video(self, input_path: str) -> VideoInfo:
+        """
+        Analyze video file and extract metadata using FFprobe.
+
+        Args:
+            input_path: Path to video file
+
+        Returns:
+            VideoInfo object with video properties
+        """
+        self._update_progress(0.0, "Analyzing video...")
+
+        cmd = [
+            'ffprobe',
+            '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_format',
+            '-show_streams',
+            input_path
+        ]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            data = json.loads(result.stdout)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"FFprobe failed: {e.stderr}")
+        except json.JSONDecodeError:
+            raise RuntimeError("Failed to parse FFprobe output")
+
+        # Find video and audio streams
+        video_stream = None
+        audio_stream = None
+        for stream in data.get('streams', []):
+            if stream.get('codec_type') == 'video' and video_stream is None:
+                video_stream = stream
+            elif stream.get('codec_type') == 'audio' and audio_stream is None:
+                audio_stream = stream
+
+        if not video_stream:
+            raise RuntimeError("No video stream found in file")
+
+        format_info = data.get('format', {})
+
+        # Parse FPS
+        fps_str = video_stream.get('r_frame_rate', '30/1')
+        if '/' in fps_str:
+            num, den = map(int, fps_str.split('/'))
+            fps = num / den if den != 0 else 30.0
+        else:
+            fps = float(fps_str)
+
+        return VideoInfo(
+            path=input_path,
+            width=int(video_stream.get('width', 1920)),
+            height=int(video_stream.get('height', 1080)),
+            fps=fps,
+            duration=float(format_info.get('duration', 0)),
+            bitrate=int(format_info.get('bit_rate', 0)),
+            codec=video_stream.get('codec_name', 'unknown'),
+            has_audio=audio_stream is not None,
+            audio_codec=audio_stream.get('codec_name') if audio_stream else None,
+            audio_bitrate=int(audio_stream.get('bit_rate', 0)) if audio_stream and audio_stream.get('bit_rate') else None,
+        )
+
+    def process(
+        self,
+        input_path: str,
+        platforms: list[str],
+        output_dir: str
+    ) -> list[str]:
+        """
+        Process video and generate unique variants for each platform.
+
+        Args:
+            input_path: Path to input video
+            platforms: List of platform names
+            output_dir: Output directory
+
+        Returns:
+            List of output file paths
+        """
+        import os
+
+        # Validate input
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+
+        # Analyze video
+        video_info = self.analyze_video(input_path)
+
+        output_paths = []
+        total_platforms = len(platforms)
+
+        for idx, platform in enumerate(platforms):
+            if platform not in PRESETS:
+                raise ValueError(f"Unknown platform: {platform}")
+
+            preset = PRESETS[platform]
+            base_progress = idx / total_platforms
+
+            self._update_progress(
+                base_progress,
+                f"Processing for {preset.name} ({idx + 1}/{total_platforms})..."
+            )
+
+            # Generate unique output
+            output_path = self._process_single(
+                video_info,
+                preset,
+                output_dir,
+                base_progress,
+                1.0 / total_platforms
+            )
+            output_paths.append(output_path)
+
+        self._update_progress(1.0, "Complete!")
+        return output_paths
 
     def _process_single(
         self,
@@ -111,7 +236,12 @@ class VideoProcessor:
                 import uuid
                 junk_msg = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
                 u_id = uuid.uuid4().hex
-                extra_args.extend(['-bsf:v', f"h264_metadata=sei_user_data='{u_id}+{junk_msg}'"])
+                codec_name, _ = params['codec']
+                if '264' in codec_name:
+                    extra_args.extend([
+                        '-bsf:v',
+                        f"h264_metadata=sei_user_data='{u_id}+{junk_msg}'"
+                    ])
                 extra_args.extend(['-metadata', f'junk_hash={junk_msg}'])
 
             if getattr(self.settings, 'enable_atomic_reorder', False):
